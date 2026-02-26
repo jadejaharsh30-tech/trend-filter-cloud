@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -10,11 +12,15 @@ import numpy as np
 
 PARQUET_FILE = "data/weekly_trend_factor.parquet"
 TOP_N = 20
+REQUIRED_COLUMNS = {
+    "date", "ticker", "adj_close", "factor", "percentile", "annualized_slope", "r2", "rebalance_week"
+}
 
 st.set_page_config(
     page_title="Trend Factor Dashboard",
     layout="wide"
 )
+
 
 # ==============================
 # LOAD DATA
@@ -22,22 +28,52 @@ st.set_page_config(
 
 @st.cache_data
 def load_data():
-    df = pd.read_parquet(PARQUET_FILE)
-    # Safety check
-    if "rebalance_week" not in df.columns:
+    parquet_path = Path(PARQUET_FILE)
+
+    if not parquet_path.exists():
+        st.error(
+            "Data file not found. Generate it first with: `python trend_factor.py` "
+            f"(expected at `{PARQUET_FILE}`)."
+        )
+        st.stop()
+
+    df = pd.read_parquet(parquet_path)
+
+    if "rebalance_week" not in df.columns and "date" in df.columns:
         df["rebalance_week"] = df["date"].dt.to_period("W-FRI")
+
+    missing_cols = sorted(REQUIRED_COLUMNS - set(df.columns))
+    if missing_cols:
+        st.error(
+            "Input data is missing required columns: "
+            + ", ".join(missing_cols)
+            + ". Rebuild the factor dataset with `python trend_factor.py`."
+        )
+        st.stop()
+
     df["rebalance_week"] = df["rebalance_week"].astype(str)
     return df
 
+
 df = load_data()
 
-def run_weekly_backtest(df, top_pct=0.2):
+
+def run_weekly_backtest(df, top_pct=0.2, transaction_cost_bps=10, missing_next_week="drop"):
     """
     Weekly long-only backtest using factor ranking.
+
+    Args:
+        top_pct: Top percentile to hold.
+        transaction_cost_bps: Round-trip cost estimate in basis points.
+        missing_next_week: How to handle constituents missing next-week prices.
+            - "drop": ignore missing holdings in weekly return average
+            - "cash": include missing holdings at 0% return
     """
     df = df.sort_values(["rebalance_week", "ticker"])
 
     portfolio_returns = []
+    turnover_series = []
+    prev_holdings = set()
 
     weeks = sorted(df["rebalance_week"].unique())
 
@@ -52,24 +88,34 @@ def run_weekly_backtest(df, top_pct=0.2):
         cutoff = snap["percentile"].quantile(1 - top_pct)
         longs = snap[snap["percentile"] >= cutoff]
 
-        if longs.empty:
+        current_holdings = set(longs["ticker"].tolist())
+
+        if not current_holdings:
             portfolio_returns.append(0.0)
+            turnover_series.append(0.0)
+            prev_holdings = current_holdings
             continue
+
+        buys = len(current_holdings - prev_holdings)
+        sells = len(prev_holdings - current_holdings)
+        turnover = (buys + sells) / max(len(current_holdings), 1)
+        turnover_series.append(turnover)
 
         # Next week prices
         next_prices = df[
             (df["rebalance_week"] == next_week) &
-            (df["ticker"].isin(longs["ticker"]))
+            (df["ticker"].isin(current_holdings))
         ][["ticker", "adj_close"]]
 
         current_prices = snap[
-            snap["ticker"].isin(longs["ticker"])
+            snap["ticker"].isin(current_holdings)
         ][["ticker", "adj_close"]]
 
         merged = current_prices.merge(
             next_prices,
             on="ticker",
-            suffixes=("_cur", "_next")
+            suffixes=("_cur", "_next"),
+            how="left"
         )
 
         merged["ret"] = (
@@ -77,12 +123,27 @@ def run_weekly_backtest(df, top_pct=0.2):
             merged["adj_close_cur"] - 1
         )
 
-        portfolio_returns.append(merged["ret"].mean())
+        if missing_next_week == "cash":
+            merged["ret"] = merged["ret"].fillna(0.0)
+        else:
+            merged = merged.dropna(subset=["ret"])
+
+        gross_ret = 0.0 if merged.empty else merged["ret"].mean()
+        cost = turnover * (transaction_cost_bps / 10000)
+        net_ret = gross_ret - cost
+
+        portfolio_returns.append(net_ret)
+        prev_holdings = current_holdings
 
     returns = pd.Series(portfolio_returns, index=weeks[:-1])
-    return returns
+    turnover = pd.Series(turnover_series, index=weeks[:-1])
+    return returns, turnover
+
 
 def performance_metrics(returns, freq=52):
+    if len(returns) == 0:
+        return np.nan, np.nan, np.nan, np.nan, pd.Series(dtype=float)
+
     ann_return = (1 + returns).prod() ** (freq / len(returns)) - 1
     ann_vol = returns.std() * np.sqrt(freq)
     sharpe = ann_return / ann_vol if ann_vol != 0 else np.nan
@@ -93,6 +154,7 @@ def performance_metrics(returns, freq=52):
     max_dd = drawdown.min()
 
     return ann_return, ann_vol, sharpe, max_dd, cum
+
 
 # ==============================
 # SIDEBAR CONTROLS
@@ -109,7 +171,9 @@ selected_week = st.sidebar.selectbox(
 
 subset = df[df["rebalance_week"] == selected_week].copy()
 
-subset = subset.sort_values("factor", ascending=True)
+subset_desc = subset.sort_values("factor", ascending=False)
+subset_asc = subset.sort_values("factor", ascending=True)
+
 
 # ==============================
 # HEADER
@@ -138,7 +202,7 @@ col4.metric("Bottom Factor", round(subset["factor"].min(), 2))
 st.subheader("🏆 Top Trend Leaders")
 
 st.dataframe(
-    subset.head(TOP_N)[
+    subset_desc.head(TOP_N)[
         ["ticker", "factor", "percentile", "annualized_slope", "r2"]
     ],
     width='stretch'
@@ -147,7 +211,7 @@ st.dataframe(
 st.subheader("🔻 Bottom Trend Laggards")
 
 st.dataframe(
-    subset.tail(TOP_N)[
+    subset_asc.head(TOP_N)[
         ["ticker", "factor", "percentile", "annualized_slope", "r2"]
     ],
     width='stretch'
@@ -220,7 +284,9 @@ st.caption(
 
 st.subheader("📉 Portfolio Backtest")
 
-top_pct = st.slider(
+col_a, col_b, col_c = st.columns(3)
+
+top_pct = col_a.slider(
     "Top percentile to hold (long-only)",
     min_value=0.05,
     max_value=0.5,
@@ -228,25 +294,42 @@ top_pct = st.slider(
     step=0.05
 )
 
+transaction_cost_bps = col_b.slider(
+    "Transaction cost (bps, round-trip)",
+    min_value=0,
+    max_value=100,
+    value=10,
+    step=1
+)
+
+missing_next_week = col_c.selectbox(
+    "Missing next-week prices",
+    options=["drop", "cash"],
+    index=0
+)
+
+
 @st.cache_data
-def run_backtest_cached(df, top_pct):
-    return run_weekly_backtest(df, top_pct)
+def run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week):
+    return run_weekly_backtest(df, top_pct, transaction_cost_bps, missing_next_week)
+
 
 with st.spinner("Running backtest..."):
-    returns = run_backtest_cached(df, top_pct)
+    returns, turnover = run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week)
 
 ann_ret, ann_vol, sharpe, max_dd, cum_curve = performance_metrics(returns)
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
-col1.metric("Annualized Return", f"{ann_ret:.2%}")
-col2.metric("Annualized Volatility", f"{ann_vol:.2%}")
-col3.metric("Sharpe Ratio", f"{sharpe:.2f}")
-col4.metric("Max Drawdown", f"{max_dd:.2%}")
+col1.metric("Annualized Return", f"{ann_ret:.2%}" if pd.notna(ann_ret) else "N/A")
+col2.metric("Annualized Volatility", f"{ann_vol:.2%}" if pd.notna(ann_vol) else "N/A")
+col3.metric("Sharpe Ratio", f"{sharpe:.2f}" if pd.notna(sharpe) else "N/A")
+col4.metric("Max Drawdown", f"{max_dd:.2%}" if pd.notna(max_dd) else "N/A")
+col5.metric("Avg Weekly Turnover", f"{turnover.mean():.2f}" if len(turnover) else "N/A")
 
 fig_pnl = px.line(
     cum_curve,
-    title="Cumulative Portfolio Value (Weekly Rebalanced)",
+    title="Cumulative Portfolio Value (Weekly Rebalanced, Net of Costs)",
     labels={"value": "Portfolio Value", "index": "Week"}
 )
 
