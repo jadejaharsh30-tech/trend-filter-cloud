@@ -1,3 +1,4 @@
+import argparse
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -19,14 +20,15 @@ BARS_IN_YEAR = 252      # annualization
 MIN_OBS = 60            # minimum data points for IPO safety
 REBALANCE_FREQ = "W-FRI"
 
-OUTPUT_FILE = "weekly_trend_factor.parquet"
+OUTPUT_FILE = "data/weekly_trend_factor.parquet"
+
 
 # ==============================
 # DATA LOADING
 # ==============================
 
-def load_data():
-    conn = sqlite3.connect(DB_PATH)
+def load_data(db_path: str = DB_PATH):
+    conn = sqlite3.connect(db_path)
     df = pd.read_sql(
         f"""
         SELECT {DATE_COL}, {TICKER_COL}, {PRICE_COL}
@@ -69,24 +71,33 @@ def exp_regression_slope_r2(log_prices: np.ndarray):
 # FACTOR COMPUTATION PER STOCK
 # ==============================
 
-def compute_factor_for_stock(stock_df: pd.DataFrame) -> pd.DataFrame:
+def compute_factor_for_stock(
+    stock_df: pd.DataFrame,
+    lookback: int = LOOKBACK,
+    min_obs: int = MIN_OBS
+) -> pd.DataFrame:
     prices = stock_df[PRICE_COL]
 
-    if len(prices) < MIN_OBS:
+    if len(prices) < min_obs:
         stock_df["annualized_slope"] = np.nan
         stock_df["r2"] = np.nan
         stock_df["factor"] = np.nan
         return stock_df
 
-    log_prices = np.log(prices)
+    # Guard against invalid log inputs.
+    valid_prices = prices.where(prices > 0)
+    log_prices = np.log(valid_prices)
 
     annualized_slopes = np.full(len(stock_df), np.nan)
     r2_values = np.full(len(stock_df), np.nan)
 
-    for i in range(LOOKBACK, len(stock_df)):
-        window = log_prices.iloc[i - LOOKBACK : i].values
-        slope, r2 = exp_regression_slope_r2(window)
+    for i in range(lookback, len(stock_df)):
+        window = log_prices.iloc[i - lookback: i].values
 
+        if np.isnan(window).any():
+            continue
+
+        slope, r2 = exp_regression_slope_r2(window)
         annualized = (np.exp(slope) ** BARS_IN_YEAR) - 1.0
 
         annualized_slopes[i] = annualized
@@ -103,12 +114,16 @@ def compute_factor_for_stock(stock_df: pd.DataFrame) -> pd.DataFrame:
 # UNIVERSE-WIDE FACTOR BUILD
 # ==============================
 
-def build_factor_universe(df: pd.DataFrame) -> pd.DataFrame:
+def build_factor_universe(
+    df: pd.DataFrame,
+    lookback: int = LOOKBACK,
+    min_obs: int = MIN_OBS
+) -> pd.DataFrame:
     results = []
 
-    for ticker, stock_df in df.groupby(TICKER_COL):
+    for _, stock_df in df.groupby(TICKER_COL):
         stock_df = stock_df.sort_values(DATE_COL).reset_index(drop=True)
-        stock_df = compute_factor_for_stock(stock_df)
+        stock_df = compute_factor_for_stock(stock_df, lookback=lookback, min_obs=min_obs)
         results.append(stock_df)
 
     return pd.concat(results, ignore_index=True)
@@ -118,16 +133,16 @@ def build_factor_universe(df: pd.DataFrame) -> pd.DataFrame:
 # WEEKLY REBALANCING & RANKING
 # ==============================
 
-def weekly_rebalance_and_rank(df: pd.DataFrame) -> pd.DataFrame:
+def weekly_rebalance_and_rank(df: pd.DataFrame, rebalance_freq: str = REBALANCE_FREQ) -> pd.DataFrame:
     df = df.dropna(subset=["factor"]).copy()
 
     # Define rebalance week
-    df["rebalance_week"] = df["date"].dt.to_period("W-FRI")
+    df["rebalance_week"] = df[DATE_COL].dt.to_period(rebalance_freq)
 
     # Keep last observation per stock per week (CRITICAL)
     weekly_snapshot = (
-        df.sort_values("date")
-          .groupby(["ticker", "rebalance_week"], as_index=False)
+        df.sort_values(DATE_COL)
+          .groupby([TICKER_COL, "rebalance_week"], as_index=False)
           .last()
     )
 
@@ -151,18 +166,30 @@ def weekly_rebalance_and_rank(df: pd.DataFrame) -> pd.DataFrame:
 # MAIN EXECUTION
 # ==============================
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build weekly trend factor dataset.")
+    parser.add_argument("--db-path", default=DB_PATH)
+    parser.add_argument("--output", default=OUTPUT_FILE)
+    parser.add_argument("--lookback", type=int, default=LOOKBACK)
+    parser.add_argument("--min-obs", type=int, default=MIN_OBS)
+    parser.add_argument("--rebalance-freq", default=REBALANCE_FREQ)
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     print("Loading data...")
-    raw_data = load_data()
+    raw_data = load_data(db_path=args.db_path)
 
     print("Building factor universe...")
-    factor_data = build_factor_universe(raw_data)
+    factor_data = build_factor_universe(raw_data, lookback=args.lookback, min_obs=args.min_obs)
 
     print("Applying weekly rebalancing and ranking...")
-    weekly_ranked = weekly_rebalance_and_rank(factor_data)
+    weekly_ranked = weekly_rebalance_and_rank(factor_data, rebalance_freq=args.rebalance_freq)
 
-    print(f"Saving output to {OUTPUT_FILE} ...")
-    weekly_ranked.to_parquet(OUTPUT_FILE)
+    print(f"Saving output to {args.output} ...")
+    weekly_ranked.to_parquet(args.output)
 
     print("Done.")
 
