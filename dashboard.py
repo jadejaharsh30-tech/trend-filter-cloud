@@ -133,36 +133,29 @@ def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
         as_of_date = pd.Timestamp.today().normalize()
 
     ordered = df.sort_values(["rebalance_week", "ticker", "date"])
+    weeks = sorted(ordered["rebalance_week"].unique())
 
     week_dates = (
         ordered.groupby("rebalance_week", as_index=False)["date"]
         .max()
         .set_index("rebalance_week")["date"]
-    )
-    weeks = week_dates.index.tolist()
-    week_to_idx = {week: idx for idx, week in enumerate(weeks)}
-
-    cutoff_per_week = ordered.groupby("rebalance_week")["percentile"].transform(
-        lambda x: x.quantile(1 - top_pct)
-    )
-    selected = ordered.loc[
-        ordered["percentile"] >= cutoff_per_week,
-        ["rebalance_week", "ticker", "date"]
-    ].copy()
-
-    week_holdings = (
-        selected.groupby("rebalance_week")["ticker"]
-        .agg(lambda x: set(x.tolist()))
         .to_dict()
     )
+
+    week_holdings = {}
+    for week in weeks:
+        snap = ordered[ordered["rebalance_week"] == week].copy()
+        cutoff = snap["percentile"].quantile(1 - top_pct)
+        longs = snap[snap["percentile"] >= cutoff]
+        week_holdings[week] = set(longs["ticker"].tolist())
 
     trade_events = []
     prev_holdings = set()
     for week in weeks:
-        current_holdings = week_holdings.get(week, set())
+        current_holdings = week_holdings[week]
         buys = current_holdings - prev_holdings
         sells = prev_holdings - current_holdings
-        trade_date = week_dates.loc[week]
+        trade_date = week_dates[week]
 
         for ticker in sorted(buys):
             trade_events.append(
@@ -176,39 +169,48 @@ def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
         prev_holdings = current_holdings
 
     holding_periods = []
-    for ticker, ticker_df in selected.groupby("ticker"):
-        ticker_weeks = ticker_df["rebalance_week"].map(week_to_idx).sort_values().to_numpy()
-        if len(ticker_weeks) == 0:
-            continue
+    all_tickers = sorted(set(ordered["ticker"].unique()))
 
-        split_idx = np.where(np.diff(ticker_weeks) > 1)[0] + 1
-        runs = np.split(ticker_weeks, split_idx)
+    for ticker in all_tickers:
+        in_position = False
+        start_week = None
 
-        for run in runs:
-            start_week_idx = int(run[0])
-            end_week_idx = int(run[-1])
-            start_week = weeks[start_week_idx]
-            end_week = weeks[end_week_idx]
-            start_date = week_dates.loc[start_week]
+        for idx, week in enumerate(weeks):
+            is_held = ticker in week_holdings[week]
+            prev_week = weeks[idx - 1] if idx > 0 else None
 
-            if end_week_idx == len(weeks) - 1:
-                end_rebalance_week = "OPEN"
-                end_date = as_of_date
-                status = "open"
-            else:
-                end_rebalance_week = end_week
-                end_date = week_dates.loc[end_week]
-                status = "closed"
+            if is_held and not in_position:
+                in_position = True
+                start_week = week
 
+            if not is_held and in_position:
+                in_position = False
+                end_week = prev_week
+                start_date = week_dates[start_week]
+                end_date = week_dates[end_week]
+                holding_periods.append(
+                    {
+                        "ticker": ticker,
+                        "start_rebalance_week": start_week,
+                        "end_rebalance_week": end_week,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "days_held": (end_date - start_date).days + 1,
+                        "status": "closed",
+                    }
+                )
+
+        if in_position:
+            start_date = week_dates[start_week]
             holding_periods.append(
                 {
                     "ticker": ticker,
                     "start_rebalance_week": start_week,
-                    "end_rebalance_week": end_rebalance_week,
+                    "end_rebalance_week": "OPEN",
                     "start_date": start_date,
-                    "end_date": end_date,
-                    "days_held": (end_date - start_date).days + 1,
-                    "status": status,
+                    "end_date": as_of_date,
+                    "days_held": (as_of_date - start_date).days + 1,
+                    "status": "open",
                 }
             )
 
@@ -410,22 +412,7 @@ def build_trade_log_cached(df, top_pct, as_of_date):
 with st.spinner("Running backtest..."):
     backtest_start = perf_counter()
     returns, turnover = run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week)
-    backtest_runtime_s = perf_counter() - backtest_start
-
-trade_log_enabled = st.checkbox("Generate trade log analytics", value=False)
-
-trades_df = pd.DataFrame(columns=["date", "rebalance_week", "ticker", "action"])
-periods_df = pd.DataFrame(columns=[
-    "ticker", "start_rebalance_week", "end_rebalance_week", "start_date", "end_date", "days_held", "status"
-])
-summary_df = pd.DataFrame(columns=["ticker", "total_days_held", "holding_period_count"])
-trade_log_runtime_s = 0.0
-
-if trade_log_enabled:
-    trade_start = perf_counter()
-    as_of_date = pd.Timestamp.today().normalize()
-    trades_df, periods_df, summary_df = build_trade_log_cached(df, top_pct, as_of_date)
-    trade_log_runtime_s = perf_counter() - trade_start
+    trades_df, periods_df, summary_df = build_holdings_and_trade_log(df, top_pct=top_pct)
 
 ann_ret, ann_vol, sharpe, max_dd, cum_curve = performance_metrics(returns)
 
@@ -452,11 +439,6 @@ st.caption(
     "Trade log includes weekly BUY/SELL actions. Holding periods show each continuous time "
     "a ticker stayed in the portfolio, including open positions through today."
 )
-
-if not trade_log_enabled:
-    st.info("Enable **Generate trade log analytics** above to build the detailed trade and holding tables.")
-else:
-    st.caption(f"Trade-log computation time: {trade_log_runtime_s:.3f}s")
 
 col_t1, col_t2 = st.columns(2)
 col_t1.metric("Trade Events", len(trades_df))
