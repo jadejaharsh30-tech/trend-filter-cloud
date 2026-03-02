@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import numpy as np
+from time import perf_counter
 
 
 # ==============================
@@ -69,26 +70,28 @@ def run_weekly_backtest(df, top_pct=0.2, transaction_cost_bps=10, missing_next_w
             - "drop": ignore missing holdings in weekly return average
             - "cash": include missing holdings at 0% return
     """
-    df = df.sort_values(["rebalance_week", "ticker"])
+    ordered = df.sort_values(["rebalance_week", "ticker"])
+
+    week_prices = {}
+    week_holdings = {}
+
+    for week, snap in ordered.groupby("rebalance_week", sort=True):
+        cutoff = snap["percentile"].quantile(1 - top_pct)
+        holdings = set(snap.loc[snap["percentile"] >= cutoff, "ticker"].tolist())
+        week_holdings[week] = holdings
+        week_prices[week] = snap.set_index("ticker")["adj_close"]
+
+    weeks = sorted(week_holdings.keys())
 
     portfolio_returns = []
     turnover_series = []
     prev_holdings = set()
 
-    weeks = sorted(df["rebalance_week"].unique())
-
     for i in range(len(weeks) - 1):
         this_week = weeks[i]
         next_week = weeks[i + 1]
 
-        # Snapshot at rebalance
-        snap = df[df["rebalance_week"] == this_week].copy()
-
-        # Select top percentile
-        cutoff = snap["percentile"].quantile(1 - top_pct)
-        longs = snap[snap["percentile"] >= cutoff]
-
-        current_holdings = set(longs["ticker"].tolist())
+        current_holdings = week_holdings[this_week]
 
         if not current_holdings:
             portfolio_returns.append(0.0)
@@ -101,34 +104,18 @@ def run_weekly_backtest(df, top_pct=0.2, transaction_cost_bps=10, missing_next_w
         turnover = (buys + sells) / max(len(current_holdings), 1)
         turnover_series.append(turnover)
 
-        # Next week prices
-        next_prices = df[
-            (df["rebalance_week"] == next_week) &
-            (df["ticker"].isin(current_holdings))
-        ][["ticker", "adj_close"]]
+        tickers = sorted(current_holdings)
+        current_prices = week_prices[this_week].reindex(tickers)
+        next_prices = week_prices[next_week].reindex(tickers)
 
-        current_prices = snap[
-            snap["ticker"].isin(current_holdings)
-        ][["ticker", "adj_close"]]
-
-        merged = current_prices.merge(
-            next_prices,
-            on="ticker",
-            suffixes=("_cur", "_next"),
-            how="left"
-        )
-
-        merged["ret"] = (
-            merged["adj_close_next"] /
-            merged["adj_close_cur"] - 1
-        )
+        returns_vec = (next_prices / current_prices) - 1
 
         if missing_next_week == "cash":
-            merged["ret"] = merged["ret"].fillna(0.0)
+            returns_vec = returns_vec.fillna(0.0)
         else:
-            merged = merged.dropna(subset=["ret"])
+            returns_vec = returns_vec.dropna()
 
-        gross_ret = 0.0 if merged.empty else merged["ret"].mean()
+        gross_ret = 0.0 if returns_vec.empty else returns_vec.mean()
         cost = turnover * (transaction_cost_bps / 10000)
         net_ret = gross_ret - cost
 
@@ -417,7 +404,13 @@ def run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week):
     return run_weekly_backtest(df, top_pct, transaction_cost_bps, missing_next_week)
 
 
+@st.cache_data
+def build_trade_log_cached(df, top_pct, as_of_date):
+    return build_holdings_and_trade_log(df, top_pct=top_pct, as_of_date=as_of_date)
+
+
 with st.spinner("Running backtest..."):
+    backtest_start = perf_counter()
     returns, turnover = run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week)
     trades_df, periods_df, summary_df = build_holdings_and_trade_log(df, top_pct=top_pct)
 
@@ -430,6 +423,7 @@ col2.metric("Annualized Volatility", f"{ann_vol:.2%}" if pd.notna(ann_vol) else 
 col3.metric("Sharpe Ratio", f"{sharpe:.2f}" if pd.notna(sharpe) else "N/A")
 col4.metric("Max Drawdown", f"{max_dd:.2%}" if pd.notna(max_dd) else "N/A")
 col5.metric("Avg Weekly Turnover", f"{turnover.mean():.2f}" if len(turnover) else "N/A")
+st.caption(f"Backtest computation time: {backtest_runtime_s:.3f}s")
 
 fig_pnl = px.line(
     cum_curve,
