@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import numpy as np
+from time import perf_counter
 
 
 # ==============================
@@ -69,26 +70,28 @@ def run_weekly_backtest(df, top_pct=0.2, transaction_cost_bps=10, missing_next_w
             - "drop": ignore missing holdings in weekly return average
             - "cash": include missing holdings at 0% return
     """
-    df = df.sort_values(["rebalance_week", "ticker"])
+    ordered = df.sort_values(["rebalance_week", "ticker"])
+
+    week_prices = {}
+    week_holdings = {}
+
+    for week, snap in ordered.groupby("rebalance_week", sort=True):
+        cutoff = snap["percentile"].quantile(1 - top_pct)
+        holdings = set(snap.loc[snap["percentile"] >= cutoff, "ticker"].tolist())
+        week_holdings[week] = holdings
+        week_prices[week] = snap.set_index("ticker")["adj_close"]
+
+    weeks = sorted(week_holdings.keys())
 
     portfolio_returns = []
     turnover_series = []
     prev_holdings = set()
 
-    weeks = sorted(df["rebalance_week"].unique())
-
     for i in range(len(weeks) - 1):
         this_week = weeks[i]
         next_week = weeks[i + 1]
 
-        # Snapshot at rebalance
-        snap = df[df["rebalance_week"] == this_week].copy()
-
-        # Select top percentile
-        cutoff = snap["percentile"].quantile(1 - top_pct)
-        longs = snap[snap["percentile"] >= cutoff]
-
-        current_holdings = set(longs["ticker"].tolist())
+        current_holdings = week_holdings[this_week]
 
         if not current_holdings:
             portfolio_returns.append(0.0)
@@ -101,34 +104,18 @@ def run_weekly_backtest(df, top_pct=0.2, transaction_cost_bps=10, missing_next_w
         turnover = (buys + sells) / max(len(current_holdings), 1)
         turnover_series.append(turnover)
 
-        # Next week prices
-        next_prices = df[
-            (df["rebalance_week"] == next_week) &
-            (df["ticker"].isin(current_holdings))
-        ][["ticker", "adj_close"]]
+        tickers = sorted(current_holdings)
+        current_prices = week_prices[this_week].reindex(tickers)
+        next_prices = week_prices[next_week].reindex(tickers)
 
-        current_prices = snap[
-            snap["ticker"].isin(current_holdings)
-        ][["ticker", "adj_close"]]
-
-        merged = current_prices.merge(
-            next_prices,
-            on="ticker",
-            suffixes=("_cur", "_next"),
-            how="left"
-        )
-
-        merged["ret"] = (
-            merged["adj_close_next"] /
-            merged["adj_close_cur"] - 1
-        )
+        returns_vec = (next_prices / current_prices) - 1
 
         if missing_next_week == "cash":
-            merged["ret"] = merged["ret"].fillna(0.0)
+            returns_vec = returns_vec.fillna(0.0)
         else:
-            merged = merged.dropna(subset=["ret"])
+            returns_vec = returns_vec.dropna()
 
-        gross_ret = 0.0 if merged.empty else merged["ret"].mean()
+        gross_ret = 0.0 if returns_vec.empty else returns_vec.mean()
         cost = turnover * (transaction_cost_bps / 10000)
         net_ret = gross_ret - cost
 
@@ -138,6 +125,107 @@ def run_weekly_backtest(df, top_pct=0.2, transaction_cost_bps=10, missing_next_w
     returns = pd.Series(portfolio_returns, index=weeks[:-1])
     turnover = pd.Series(turnover_series, index=weeks[:-1])
     return returns, turnover
+
+
+def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
+    """Build weekly holdings, trade events, and holding periods per ticker."""
+    if as_of_date is None:
+        as_of_date = pd.Timestamp.today().normalize()
+
+    ordered = df.sort_values(["rebalance_week", "ticker", "date"])
+
+    week_dates = (
+        ordered.groupby("rebalance_week", as_index=False)["date"]
+        .max()
+        .set_index("rebalance_week")["date"]
+    )
+    weeks = week_dates.index.tolist()
+    week_to_idx = {week: idx for idx, week in enumerate(weeks)}
+
+    cutoff_per_week = ordered.groupby("rebalance_week")["percentile"].transform(
+        lambda x: x.quantile(1 - top_pct)
+    )
+    selected = ordered.loc[
+        ordered["percentile"] >= cutoff_per_week,
+        ["rebalance_week", "ticker", "date"]
+    ].copy()
+
+    week_holdings = (
+        selected.groupby("rebalance_week")["ticker"]
+        .agg(lambda x: set(x.tolist()))
+        .to_dict()
+    )
+
+    trade_events = []
+    prev_holdings = set()
+    for week in weeks:
+        current_holdings = week_holdings.get(week, set())
+        buys = current_holdings - prev_holdings
+        sells = prev_holdings - current_holdings
+        trade_date = week_dates.loc[week]
+
+        for ticker in sorted(buys):
+            trade_events.append(
+                {"date": trade_date, "rebalance_week": week, "ticker": ticker, "action": "BUY"}
+            )
+        for ticker in sorted(sells):
+            trade_events.append(
+                {"date": trade_date, "rebalance_week": week, "ticker": ticker, "action": "SELL"}
+            )
+
+        prev_holdings = current_holdings
+
+    holding_periods = []
+    for ticker, ticker_df in selected.groupby("ticker"):
+        ticker_weeks = ticker_df["rebalance_week"].map(week_to_idx).sort_values().to_numpy()
+        if len(ticker_weeks) == 0:
+            continue
+
+        split_idx = np.where(np.diff(ticker_weeks) > 1)[0] + 1
+        runs = np.split(ticker_weeks, split_idx)
+
+        for run in runs:
+            start_week_idx = int(run[0])
+            end_week_idx = int(run[-1])
+            start_week = weeks[start_week_idx]
+            end_week = weeks[end_week_idx]
+            start_date = week_dates.loc[start_week]
+
+            if end_week_idx == len(weeks) - 1:
+                end_rebalance_week = "OPEN"
+                end_date = as_of_date
+                status = "open"
+            else:
+                end_rebalance_week = end_week
+                end_date = week_dates.loc[end_week]
+                status = "closed"
+
+            holding_periods.append(
+                {
+                    "ticker": ticker,
+                    "start_rebalance_week": start_week,
+                    "end_rebalance_week": end_rebalance_week,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "days_held": (end_date - start_date).days + 1,
+                    "status": status,
+                }
+            )
+
+    trades_df = pd.DataFrame(trade_events).sort_values(["date", "ticker", "action"]).reset_index(drop=True)
+    periods_df = pd.DataFrame(holding_periods).sort_values(["ticker", "start_date"]).reset_index(drop=True)
+
+    if periods_df.empty:
+        summary_df = pd.DataFrame(columns=["ticker", "total_days_held", "holding_period_count"])
+    else:
+        summary_df = (
+            periods_df.groupby("ticker", as_index=False)
+            .agg(total_days_held=("days_held", "sum"), holding_period_count=("ticker", "size"))
+            .sort_values("total_days_held", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    return trades_df, periods_df, summary_df
 
 
 def performance_metrics(returns, freq=52):
@@ -314,8 +402,30 @@ def run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week):
     return run_weekly_backtest(df, top_pct, transaction_cost_bps, missing_next_week)
 
 
+@st.cache_data
+def build_trade_log_cached(df, top_pct, as_of_date):
+    return build_holdings_and_trade_log(df, top_pct=top_pct, as_of_date=as_of_date)
+
+
 with st.spinner("Running backtest..."):
+    backtest_start = perf_counter()
     returns, turnover = run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week)
+    backtest_runtime_s = perf_counter() - backtest_start
+
+trade_log_enabled = st.checkbox("Generate trade log analytics", value=False)
+
+trades_df = pd.DataFrame(columns=["date", "rebalance_week", "ticker", "action"])
+periods_df = pd.DataFrame(columns=[
+    "ticker", "start_rebalance_week", "end_rebalance_week", "start_date", "end_date", "days_held", "status"
+])
+summary_df = pd.DataFrame(columns=["ticker", "total_days_held", "holding_period_count"])
+trade_log_runtime_s = 0.0
+
+if trade_log_enabled:
+    trade_start = perf_counter()
+    as_of_date = pd.Timestamp.today().normalize()
+    trades_df, periods_df, summary_df = build_trade_log_cached(df, top_pct, as_of_date)
+    trade_log_runtime_s = perf_counter() - trade_start
 
 ann_ret, ann_vol, sharpe, max_dd, cum_curve = performance_metrics(returns)
 
@@ -326,6 +436,7 @@ col2.metric("Annualized Volatility", f"{ann_vol:.2%}" if pd.notna(ann_vol) else 
 col3.metric("Sharpe Ratio", f"{sharpe:.2f}" if pd.notna(sharpe) else "N/A")
 col4.metric("Max Drawdown", f"{max_dd:.2%}" if pd.notna(max_dd) else "N/A")
 col5.metric("Avg Weekly Turnover", f"{turnover.mean():.2f}" if len(turnover) else "N/A")
+st.caption(f"Backtest computation time: {backtest_runtime_s:.3f}s")
 
 fig_pnl = px.line(
     cum_curve,
@@ -334,3 +445,42 @@ fig_pnl = px.line(
 )
 
 st.plotly_chart(fig_pnl, width='stretch')
+
+st.subheader("📒 Trade Log & Holding Durations")
+
+st.caption(
+    "Trade log includes weekly BUY/SELL actions. Holding periods show each continuous time "
+    "a ticker stayed in the portfolio, including open positions through today."
+)
+
+if not trade_log_enabled:
+    st.info("Enable **Generate trade log analytics** above to build the detailed trade and holding tables.")
+else:
+    st.caption(f"Trade-log computation time: {trade_log_runtime_s:.3f}s")
+
+col_t1, col_t2 = st.columns(2)
+col_t1.metric("Trade Events", len(trades_df))
+col_t2.metric("Unique Tickers Held", summary_df["ticker"].nunique() if not summary_df.empty else 0)
+
+st.markdown("**Per-Ticker Total Holding Days**")
+st.dataframe(summary_df, width='stretch')
+
+st.markdown("**Ticker Holding Periods (Start/End Dates)**")
+st.dataframe(periods_df, width='stretch')
+
+st.markdown("**Weekly Trade Log**")
+st.dataframe(trades_df, width='stretch')
+
+st.download_button(
+    "Download trade log CSV",
+    data=trades_df.to_csv(index=False),
+    file_name="trade_log.csv",
+    mime="text/csv",
+)
+
+st.download_button(
+    "Download holding periods CSV",
+    data=periods_df.to_csv(index=False),
+    file_name="holding_periods.csv",
+    mime="text/csv",
+)
