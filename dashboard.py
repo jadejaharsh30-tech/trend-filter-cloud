@@ -133,6 +133,7 @@ def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
         as_of_date = pd.Timestamp.today().normalize()
 
     ordered = df.sort_values(["rebalance_week", "ticker", "date"])
+    weeks = sorted(ordered["rebalance_week"].unique())
 
     week_dates = (
         ordered.groupby("rebalance_week", as_index=False)["date"]
@@ -163,11 +164,32 @@ def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
         buys = current_holdings - prev_holdings
         sells = prev_holdings - current_holdings
         trade_date = week_dates.loc[week]
+        .to_dict()
+    )
+
+    week_holdings = {}
+    for week in weeks:
+        snap = ordered[ordered["rebalance_week"] == week].copy()
+        cutoff = snap["percentile"].quantile(1 - top_pct)
+        longs = snap[snap["percentile"] >= cutoff]
+        week_holdings[week] = set(longs["ticker"].tolist())
+
+    trade_events = []
+    prev_holdings = set()
+    for week in weeks:
+        current_holdings = week_holdings[week]
+        buys = current_holdings - prev_holdings
+        sells = prev_holdings - current_holdings
+        trade_date = week_dates[week]
 
         for ticker in sorted(buys):
-            trade_events.append({"date": trade_date, "rebalance_week": week, "ticker": ticker, "action": "BUY"})
+            trade_events.append(
+                {"date": trade_date, "rebalance_week": week, "ticker": ticker, "action": "BUY"}
+            )
         for ticker in sorted(sells):
-            trade_events.append({"date": trade_date, "rebalance_week": week, "ticker": ticker, "action": "SELL"})
+            trade_events.append(
+                {"date": trade_date, "rebalance_week": week, "ticker": ticker, "action": "SELL"}
+            )
 
         prev_holdings = current_holdings
 
@@ -196,6 +218,39 @@ def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
                 end_date = week_dates.loc[end_week]
                 status = "closed"
 
+    all_tickers = sorted(set(ordered["ticker"].unique()))
+
+    for ticker in all_tickers:
+        in_position = False
+        start_week = None
+
+        for idx, week in enumerate(weeks):
+            is_held = ticker in week_holdings[week]
+            prev_week = weeks[idx - 1] if idx > 0 else None
+
+            if is_held and not in_position:
+                in_position = True
+                start_week = week
+
+            if not is_held and in_position:
+                in_position = False
+                end_week = prev_week
+                start_date = week_dates[start_week]
+                end_date = week_dates[end_week]
+                holding_periods.append(
+                    {
+                        "ticker": ticker,
+                        "start_rebalance_week": start_week,
+                        "end_rebalance_week": end_week,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "days_held": (end_date - start_date).days + 1,
+                        "status": "closed",
+                    }
+                )
+
+        if in_position:
+            start_date = week_dates[start_week]
             holding_periods.append(
                 {
                     "ticker": ticker,
@@ -205,6 +260,11 @@ def build_holdings_and_trade_log(df, top_pct=0.2, as_of_date=None):
                     "end_date": end_date,
                     "days_held": (end_date - start_date).days + 1,
                     "status": status,
+                    "end_rebalance_week": "OPEN",
+                    "start_date": start_date,
+                    "end_date": as_of_date,
+                    "days_held": (as_of_date - start_date).days + 1,
+                    "status": "open",
                 }
             )
 
@@ -423,6 +483,10 @@ if trade_log_enabled:
     as_of_date = pd.Timestamp.today().normalize()
     trades_df, periods_df, summary_df = build_trade_log_cached(df, top_pct, as_of_date)
     trade_log_runtime_s = perf_counter() - trade_start
+with st.spinner("Running backtest..."):
+    backtest_start = perf_counter()
+    returns, turnover = run_backtest_cached(df, top_pct, transaction_cost_bps, missing_next_week)
+    trades_df, periods_df, summary_df = build_holdings_and_trade_log(df, top_pct=top_pct)
 
 ann_ret, ann_vol, sharpe, max_dd, cum_curve = performance_metrics(returns)
 
