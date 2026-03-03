@@ -306,11 +306,11 @@ def performance_metrics(returns, freq=52):
 
 st.sidebar.title("Controls")
 
-weeks = sorted(df["rebalance_week"].unique())
+weeks = sorted(df["rebalance_week"].unique(), reverse=True)
 selected_week = st.sidebar.selectbox(
     "Rebalance Week",
     weeks,
-    index=len(weeks) - 1
+    index=0
 )
 
 subset = df[df["rebalance_week"] == selected_week].copy()
